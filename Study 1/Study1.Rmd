@@ -70,6 +70,69 @@ main.df <- subset(
 
 ```
 
+# Match average word count per participant × scenario
+
+```{r}
+word_count.df <- read.csv("word_count.csv")
+human_resp.df <- read.csv("Human_responses.csv")
+llm_resp.df   <- read.csv("LLM_responses.csv")
+
+# Helper: normalise response text for matching — lowercase, trim whitespace, remove trailing punctuation
+normalise_text <- function(x) str_trim(str_remove(tolower(x), "[.!?,;:]+$"))
+
+# Human: match word_count rows to Qualtrics response_id via response text + scenario,
+# then average across the 5 options per participant × scenario.
+# Deduplication on both sides ensures identical short responses (e.g. "Do nothing")
+# don't create spurious row explosions after joining.
+human_wc <- word_count.df %>%
+  filter(llm == 0) %>%
+  select(response, word_count, scenario) %>%
+  mutate(response_norm = normalise_text(response)) %>%
+  distinct(response_norm, scenario, word_count) %>%
+  inner_join(
+    human_resp.df %>%
+      select(response_id, scenario, response) %>%
+      mutate(response_norm = normalise_text(response)) %>%
+      distinct(response_id, scenario, response_norm),
+    by = c("response_norm", "scenario"),
+    relationship = "many-to-many"
+  ) %>%
+  group_by(response_id, scenario) %>%
+  summarise(avg_word_count = mean(word_count, na.rm = TRUE), .groups = "drop")
+
+# LLM: split concatenated options (separated by "<br><br>"), strip leading "#",
+# then match to word_count and average across the 5 options per participant × scenario
+llm_split.df <- llm_resp.df %>%
+  select(response_id, scenario, response) %>%
+  mutate(option = str_split(response, "<br><br>")) %>%
+  select(-response) %>%
+  unnest(option) %>%
+  mutate(option = normalise_text(str_remove(option, "^#"))) %>%
+  filter(option != "") %>%
+  distinct(response_id, scenario, option)
+
+llm_wc <- word_count.df %>%
+  filter(llm == 1) %>%
+  select(response, word_count, scenario) %>%
+  mutate(response_norm = normalise_text(response)) %>%
+  distinct(response_norm, scenario, word_count) %>%
+  inner_join(
+    llm_split.df %>% rename(response_norm = option),
+    by = c("response_norm", "scenario"),
+    relationship = "many-to-many"
+  ) %>%
+  group_by(response_id, scenario) %>%
+  summarise(avg_word_count = mean(word_count, na.rm = TRUE), .groups = "drop")
+
+# Combine and format scenario to match the "scenario X" labels used downstream
+avg_wc_lookup <- bind_rows(human_wc, llm_wc) %>%
+  mutate(scenario = paste0("scenario ", scenario))
+
+# Sanity check
+cat("Human participants with word count matched:", n_distinct(human_wc$response_id), "\n")
+cat("LLM participants with word count matched:  ", n_distinct(llm_wc$response_id),   "\n")
+```
+
 # Demographics
 
 ```{r}
@@ -110,19 +173,20 @@ mutate(age_1_text= as.numeric(age_1_text)) %>%
 #Create Basic Wide Dataframe with all ratings
 
 ```{r}
-exp1.df<-main.df %>% 
-  mutate(participant = 1:n()) %>% 
+exp1.df<-main.df %>%
+  mutate(participant = 1:n()) %>%
   select(c1_s1_t_first_click:c2_s9_cf5_6,
          participant,
+         response_id,
          experiment,
          feedback1,
          feedback2)%>%
-    select(-contains("last_click"), -contains("click_count")) %>% 
-    filter(!grepl("^yes", feedback1, ignore.case = TRUE)) %>% 
-    filter(!grepl("^yes", feedback2, ignore.case = TRUE)) %>% 
+    select(-contains("last_click"), -contains("click_count")) %>%
+    filter(!grepl("^yes", feedback1, ignore.case = TRUE)) %>%
+    filter(!grepl("^yes", feedback2, ignore.case = TRUE)) %>%
     select(-feedback1) %>%   # Remove the feedback1 column
    select(-feedback2) %>%   # Remove the feedback2 column
-  gather(condition, response, -participant,-experiment) %>% 
+  gather(condition, response, -participant, -response_id, -experiment) %>%
   filter(response != "") %>% 
   mutate(exp_condition = case_when(
     str_detect(condition, "c1_") ~ "judgment last",
@@ -177,8 +241,8 @@ exp1.df<-main.df %>%
 ```{r}
 
 #All Data Long Format
-exp1_long.df = exp1.df %>% 
-    gather(responsetype, response, -scenario, -participant, -exp_condition, -experiment, -first_click, -page_submit, - blame) %>%
+exp1_long.df = exp1.df %>%
+    gather(responsetype, response, -scenario, -participant, -response_id, -exp_condition, -experiment, -first_click, -page_submit, -blame) %>%
  mutate(response_order = case_when(
     str_detect(responsetype, "_1") ~ "1",
     str_detect(responsetype, "_2") ~ "2",
@@ -195,11 +259,13 @@ exp1_long.df = exp1.df %>%
     select(-responsetype) 
 
 #All Data Wide Format
-exp1_wide.df = exp1_long.df %>% 
+exp1_wide.df = exp1_long.df %>%
   pivot_wider(names_from = response_category,
-              values_from = response) %>% 
-  mutate(across(c(probability, morality, normality), as.numeric)) %>% 
-    mutate(avg=(normality+probability+morality)/3)
+              values_from = response) %>%
+  mutate(across(c(probability, morality, normality), as.numeric)) %>%
+  mutate(avg = (normality + probability + morality) / 3) %>%
+  # Join avg_word_count (mean of 5 options) per participant × scenario
+  left_join(avg_wc_lookup, by = c("response_id", "scenario"))
 
 
 
@@ -310,9 +376,10 @@ print(withinData)
 #Create New Dataframe for Analysis
 
 ```{r}
-exp1_model.df<-withinData %>%  
-   filter(response_order==1 & response_category=="avg") %>% 
-  mutate(blame=as.numeric(blame))
+exp1_model.df <- withinData %>%
+  filter(response_order == 1 & response_category == "avg") %>%
+  mutate(blame = as.numeric(blame)) %>%
+  left_join(avg_wc_lookup, by = c("response_id", "scenario"))
 ```
 
 
@@ -454,8 +521,6 @@ anova(model_exp, full_model)
 fixef(full_model)              # named vector of fixed-effect estimates ("betas")
 coef(summary(full_model))      # estimates + SE + t value
 confint(full_model, method="Wald")
-
-
 
 
 ```
