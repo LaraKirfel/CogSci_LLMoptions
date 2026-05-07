@@ -43,9 +43,6 @@ llm2 <- fread("data/main/llm2.csv")
 llm <- rbind(llm1, llm2)
 
 
-# hum <- fread("data/pilot_1/pilot_human.csv")
-# llm <- fread("data/pilot_1/pilot_llm.csv")
-
 ```
 
 
