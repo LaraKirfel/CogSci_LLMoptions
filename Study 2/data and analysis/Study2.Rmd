@@ -1,0 +1,662 @@
+---
+title: "LLM & Human Possibilities, Study 2"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(ggrepel)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(knitr)
+library(purrr)
+library(janitor)
+library(stringr)
+library(psych)
+library(data.table)
+
+knitr::opts_chunk$set(echo = TRUE, dpi = 300, fig.width = 7)
+```
+
+
+# Read in Data
+
+Three CSV files were exported from Qualtrics: one for the Human condition and
+two for the LLM condition (collected across two survey waves). The first two
+rows of each Qualtrics export contain metadata and are removed. Column names
+are standardised to snake_case using `clean_names()`. The two LLM files are
+combined after removing a redundant column (`icecream2`) present only in the
+second wave. Empty strings are recoded as `NA` throughout.
+
+```{r read-data, echo=FALSE}
+llm1 <- fread("llm.csv",  check.names = FALSE)
+llm2 <- fread("llm2.csv", check.names = FALSE) %>%
+  select(-any_of("icecream2"))
+
+hum  <- fread("human.csv", check.names = FALSE)
+
+llm.df <- bind_rows(llm1, llm2) %>%
+  slice(-c(1:2)) %>%
+  clean_names() %>%
+  select(-matches("_Response")) %>%
+  mutate(experiment = "LLM")
+
+hum.df <- hum %>%
+  slice(-c(1:2)) %>%
+  clean_names() %>%
+  select(-matches("_fr_")) %>%
+  mutate(experiment = "Human")
+
+main.df <- bind_rows(llm.df, hum.df) %>%
+  filter(progress == 100,
+         distribution_channel != "preview") %>%
+  mutate(across(everything(), ~ na_if(., "")))
+```
+
+
+# Participant Exclusions
+
+Participants were excluded if: (1) they self-reported a compromised survey
+experience (`compromised == "Yes"`), (2) their reCAPTCHA score indicated
+bot-like behaviour (score ≤ 0.5), or (3) they failed an attention check
+embedded in the survey (`icecream == "Salt and Pepper"`).
+
+```{r exclusions, echo=FALSE}
+main.df <- subset(
+  main.df,
+  is.na(compromised) |
+    !(
+      (compromised == "Yes") |
+      (!is.na(q_recaptcha_score) & q_recaptcha_score <= 0.5) |
+      (!is.na(icecream) & icecream == "Salt and Pepper")
+    )
+)
+```
+
+
+# Demographics
+
+```{r demographics, echo=FALSE}
+desc1.df <- main.df %>%
+  select(duration_in_seconds, ethnicity, gender) %>%
+  mutate(duration_in_seconds = as.numeric(duration_in_seconds)) %>%
+  summarise(
+    n             = n(),
+    female        = sum(gender == "Female",                                na.rm = TRUE),
+    male          = sum(gender == "Male",                                  na.rm = TRUE),
+    non_binary    = sum(gender == "Non-Binary",                            na.rm = TRUE),
+    undisclosed   = sum(gender == "Prefer not to say",                     na.rm = TRUE),
+    other         = sum(gender == "Other",                                 na.rm = TRUE),
+    white         = sum(ethnicity == "Caucasian/White",                    na.rm = TRUE),
+    black         = sum(ethnicity == "Black/African",                      na.rm = TRUE),
+    latino        = sum(ethnicity == "Hispanic/Latinx",                    na.rm = TRUE),
+    native        = sum(ethnicity == "Alaskan or American Indian",         na.rm = TRUE),
+    asian         = sum(ethnicity == "Asian",                              na.rm = TRUE),
+    east          = sum(ethnicity == "Middle Eastern or Northern African",  na.rm = TRUE),
+    multi         = sum(ethnicity == "Multiethnic",                        na.rm = TRUE),
+    e_undisclosed = sum(ethnicity == "Prefer not to disclose",             na.rm = TRUE),
+    mean_time     = mean(duration_in_seconds / 60, na.rm = TRUE),
+    sd_time       = sd(duration_in_seconds   / 60, na.rm = TRUE)
+  )
+
+desc_age.df <- main.df %>%
+  mutate(age = as.numeric(age)) %>%
+  select(age) %>%
+  filter(!is.na(age), age < 100) %>%
+  summarise(
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age   = sd(age,  na.rm = TRUE)
+  )
+
+# Total N after exclusions
+knitr::kable(data.frame(N = desc1.df$n), caption = "Total participants after exclusions")
+
+# Table 1: Gender and ethnicity
+gender_ethnicity_table <- data.frame(
+  Category = c("Female", "Male", "Non-binary", "Prefer not to say", "Other",
+               "Caucasian/White", "Black/African", "Hispanic/Latinx",
+               "Alaskan or American Indian", "Asian",
+               "Middle Eastern or Northern African", "Multiethnic",
+               "Prefer not to disclose"),
+  Group = c(rep("Gender", 5), rep("Ethnicity", 8)),
+  N = c(desc1.df$female, desc1.df$male, desc1.df$non_binary,
+        desc1.df$undisclosed, desc1.df$other,
+        desc1.df$white, desc1.df$black, desc1.df$latino,
+        desc1.df$native, desc1.df$asian, desc1.df$east,
+        desc1.df$multi, desc1.df$e_undisclosed)
+)
+knitr::kable(gender_ethnicity_table, caption = "Gender and Ethnicity")
+
+# Table 2: Age and study duration
+time_age_table <- data.frame(
+  Measure = c("Age (years)", "Study duration (minutes)"),
+  Mean    = round(c(desc_age.df$mean_age, desc1.df$mean_time), 2),
+  SD      = round(c(desc_age.df$sd_age,   desc1.df$sd_time),   2)
+)
+knitr::kable(time_age_table, caption = "Age and Study Duration")
+```
+
+
+# Data Preparation
+
+## Main Dataframe
+
+The raw data are reshaped from wide to long format and back, parsing each
+column name to extract: the experimental condition (`condition` = 1 → judgment
+last, `condition` = 2 → judgment first), the scenario number (1–9), and the
+response type (probability, morality, and normality ratings for each of 5
+generated options, the actual action, blame, and counterfactual ratings). Rows
+in which all three actual-action rating columns are NULL, or in which the blame
+column does not contain exactly one value (due to a coding error in one survey
+wave), are removed at this stage.
+
+```{r create-exp2, echo=FALSE}
+exp2.df <- main.df %>%
+  mutate(participant = 1:n()) %>%
+  select(x1_s1_t_first_click:x117_s9_cf5_6,
+         x120_s5_t_first_click:x223_s5_cf5_6,
+         participant,
+         experiment,
+         condition) %>%
+  select(-contains("last_click"), -contains("click_count")) %>%
+  gather(category, response, -participant, -experiment, -condition) %>%
+  filter(response != "") %>%
+  mutate(exp_condition = case_when(
+    str_detect(condition, "1") ~ "judgment last",
+    str_detect(condition, "2") ~ "judgment first"
+  )) %>%
+  mutate(scenario = case_when(
+    str_detect(category, "s1_") ~ "scenario 1",
+    str_detect(category, "s2_") ~ "scenario 2",
+    str_detect(category, "s3_") ~ "scenario 3",
+    str_detect(category, "s4_") ~ "scenario 4",
+    str_detect(category, "s5_") ~ "scenario 5",
+    str_detect(category, "s6_") ~ "scenario 6",
+    str_detect(category, "s7_") ~ "scenario 7",
+    str_detect(category, "s8_") ~ "scenario 8",
+    str_detect(category, "s9_") ~ "scenario 9"
+  )) %>%
+  mutate(responsetype = case_when(
+    str_detect(category, "a1_4") ~ "prob_resp_1",
+    str_detect(category, "a1_5") ~ "moral_resp_1",
+    str_detect(category, "a1_6") ~ "normal_resp_1",
+    str_detect(category, "a2_4") ~ "prob_resp_2",
+    str_detect(category, "a2_5") ~ "moral_resp_2",
+    str_detect(category, "a2_6") ~ "normal_resp_2",
+    str_detect(category, "a3_4") ~ "prob_resp_3",
+    str_detect(category, "a3_5") ~ "moral_resp_3",
+    str_detect(category, "a3_6") ~ "normal_resp_3",
+    str_detect(category, "a4_4") ~ "prob_resp_4",
+    str_detect(category, "a4_5") ~ "moral_resp_4",
+    str_detect(category, "a4_6") ~ "normal_resp_4",
+    str_detect(category, "a5_4") ~ "prob_resp_5",
+    str_detect(category, "a5_5") ~ "moral_resp_5",
+    str_detect(category, "a5_6") ~ "normal_resp_5",
+    str_detect(category, "ar_4") ~ "prob_resp_act",
+    str_detect(category, "ar_5") ~ "moral_resp_act",
+    str_detect(category, "ar_6") ~ "normal_resp_act",
+    str_detect(category, "b_")   ~ "blame",
+    str_detect(category, "cf1")  ~ "cf_1",
+    str_detect(category, "cf2")  ~ "cf_2",
+    str_detect(category, "cf3")  ~ "cf_3",
+    str_detect(category, "cf4")  ~ "cf_4",
+    str_detect(category, "cf5")  ~ "cf_5",
+    str_detect(category, "first_click") ~ "first_click",
+    str_detect(category, "page_submit") ~ "page_submit"
+  )) %>%
+  select(-condition, -category) %>%
+  pivot_wider(names_from = responsetype, values_from = response) %>%
+  # Remove rows where all actual-action rating columns are NULL (coding error)
+  filter(
+    !(sapply(prob_resp_act,   is.null) &
+      sapply(moral_resp_act,  is.null) &
+      sapply(normal_resp_act, is.null))
+  ) %>%
+  # Keep only rows where blame contains exactly one value
+  filter(sapply(blame, length) == 1) %>%
+  mutate(blame = unlist(blame))
+```
+
+```{r reshape, echo=FALSE}
+# Long format: one row per participant × scenario × option × rating dimension
+exp2_long.df <- exp2.df %>%
+  gather(responsetype, response,
+         -scenario, -participant, -exp_condition,
+         -experiment, -first_click, -page_submit, -blame) %>%
+  mutate(response_order = case_when(
+    str_detect(responsetype, "_1")   ~ "1",
+    str_detect(responsetype, "_2")   ~ "2",
+    str_detect(responsetype, "_3")   ~ "3",
+    str_detect(responsetype, "_4")   ~ "4",
+    str_detect(responsetype, "_5")   ~ "5",
+    str_detect(responsetype, "_act") ~ "act"
+  )) %>%
+  mutate(response_category = case_when(
+    str_detect(responsetype, "prob_")   ~ "probability",
+    str_detect(responsetype, "moral_")  ~ "morality",
+    str_detect(responsetype, "normal_") ~ "normality",
+    str_detect(responsetype, "cf_")     ~ "counterfactual"
+  )) %>%
+  select(-responsetype)
+
+# Wide format including all response orders (generated options + actual action).
+# Probability, morality, and normality are averaged into a composite value (avg).
+exp2_wide_all.df <- exp2_long.df %>%
+  pivot_wider(names_from = response_category, values_from = response) %>%
+  mutate(across(c(probability, morality, normality), as.numeric)) %>%
+  mutate(avg = (normality + probability + morality) / 3)
+
+# Generated options only (response_order 1–5), long format including avg composite.
+# Used for the sample sum calculation.
+exp2_long_avg.df <- exp2_wide_all.df %>%
+  pivot_longer(
+    cols      = c(probability, morality, normality, avg),
+    names_to  = "response_category",
+    values_to = "response"
+  ) %>%
+  filter(response_order != "act") %>%
+  mutate(response = as.numeric(response))
+
+# Actual action ratings only (response_order = "act"), individual level.
+# Used to obtain each participant's baseline action value for the sample sum.
+exp2_long_act.df <- exp2_wide_all.df %>%
+  pivot_longer(
+    cols      = c(probability, morality, normality, avg),
+    names_to  = "response_category",
+    values_to = "response"
+  ) %>%
+  filter(response_order == "act") %>%
+  mutate(response = as.numeric(response))
+
+# Wide format for the actual action only. Used for the actual action value model.
+exp2_wide_act.df <- exp2_long.df %>%
+  filter(response_order == "act") %>%
+  pivot_wider(names_from = response_category, values_from = response) %>%
+  mutate(across(c(probability, morality, normality), as.numeric)) %>%
+  mutate(avg = (normality + probability + morality) / 3) %>%
+  mutate(experiment = relevel(factor(experiment), ref = "Human"))
+
+# Wide format for generated options only (response_order 1–5), with experiment
+# releveled and response_order treated as an ordered factor. Used for option value models.
+exp2_wide.df <- exp2_long.df %>%
+  pivot_wider(names_from = response_category, values_from = response) %>%
+  mutate(across(c(probability, morality, normality), as.numeric)) %>%
+  mutate(avg = (normality + probability + morality) / 3) %>%
+  filter(response_order != "act") %>%
+  mutate(
+    experiment     = relevel(factor(experiment), ref = "Human"),
+    response_order = ordered(as.integer(as.character(response_order)), levels = 1:5)
+  )
+```
+
+
+# Analysis
+
+## Internal Consistency of Ratings
+
+The three rating dimensions (probability, morality, normality) were examined
+for internal consistency across all generated options.
+
+```{r reliability, message=FALSE, warning=FALSE}
+ratings_matrix <- exp2_wide.df %>%
+  select(probability, morality, normality) %>%
+  filter(complete.cases(.))
+
+alpha_result <- psych::alpha(ratings_matrix)
+
+# Average inter-rating r (mean of pairwise correlations)
+cor_matrix <- cor(ratings_matrix, use = "complete.obs")
+mean_r <- mean(cor_matrix[upper.tri(cor_matrix)])
+
+# Summary: Cronbach's alpha and average inter-rating r
+data.frame(
+  measure = c("Cronbach's alpha", "Average inter-rating r"),
+  value   = round(c(alpha_result$total$raw_alpha, mean_r), 2)
+)
+
+# Corrected rating-composite correlations
+round(alpha_result$item.stats[, "r.cor", drop = FALSE], 2)
+```
+
+
+## Sample Sum
+
+For each participant and scenario, we calculate the **sample sum**: the total
+amount by which the generated options exceed the value of the agent's actual
+action. Formally, for each option whose composite value exceeds the action's
+composite value, we sum the difference. For the small number of cases where a
+single scenario's actual action rating is missing, that scenario is skipped and
+the corresponding sample sum entry is left as NA (excluded from the blame
+models below).
+
+```{r sample-sum}
+withinData <- exp2_long_avg.df %>%
+  mutate(sampleSum = NA) %>%
+  ungroup()
+
+for (subj in unique(withinData$participant)) {
+  d <- withinData %>% filter(participant == subj)
+
+  for (e in unique(d$experiment)) {
+    for (c in unique(d$scenario)) {
+
+      # Composite ratings for each generated option
+      pgSamp <- exp2_long_avg.df %>%
+        filter(participant == subj, scenario == c,
+               experiment == e, response_category == "avg") %>%
+        pull(response)
+
+      # Composite rating for the actual action
+      a_val <- exp2_long_act.df %>%
+        filter(participant == subj, scenario == c,
+               experiment == e, response_category == "avg") %>%
+        pull(response)
+
+      # Skip if actual action rating is missing for this scenario
+      if (length(a_val) == 0 || is.na(a_val)) next
+
+      # Sample sum: total excess of generated options over the actual action
+      withinData$sampleSum[
+        withinData$participant == subj &
+        withinData$scenario    == c    &
+        withinData$experiment  == e
+      ] <- sum(pgSamp[pgSamp > a_val] - a_val)
+    }
+  }
+}
+```
+
+```{r create-model-df, echo=FALSE}
+# One row per participant × scenario: avg composite rating and blame rating
+exp2_model.df <- withinData %>%
+  filter(response_order == 1 & response_category == "avg") %>%
+  mutate(blame = as.numeric(blame))
+
+# Remove rows with missing sampleSum (scenario-level missingness) so all
+# blame models are fitted on identical data
+exp2_blame.df <- exp2_model.df %>%
+  filter(!is.na(sampleSum))
+```
+
+
+## Value of Generated Options
+
+We used linear mixed-effects models (LMERs) to examine whether the composite
+value of generated options differed between experimental conditions (LLM vs.
+Human) and across generation order (options 1–5). Scenario and participant were
+included as crossed random intercepts. Models were compared using likelihood
+ratio tests (ML estimation).
+
+```{r option-values, message=FALSE, warning=FALSE}
+model_0 <- lmer(avg ~ 1 + (1 | scenario) + (1 | participant),
+                data = exp2_wide.df, REML = FALSE)
+
+model_1 <- lmer(avg ~ experiment + (1 | scenario) + (1 | participant),
+                data = exp2_wide.df, REML = FALSE)
+
+model_2 <- lmer(avg ~ experiment + response_order + (1 | scenario) + (1 | participant),
+                data = exp2_wide.df, REML = FALSE)
+
+model_3 <- lmer(avg ~ experiment * response_order + (1 | scenario) + (1 | participant),
+                data = exp2_wide.df, REML = FALSE)
+
+anova(model_0, model_1, model_2, model_3)
+
+# Model 2: main effects only
+cat("\n--- Model 2: experiment + response_order ---\n")
+coef(summary(model_2))
+
+# Model 3: interaction
+cat("\n--- Model 3: experiment × response_order ---\n")
+```
+
+```{r option-values-contrasts, message=FALSE, warning=FALSE}
+emm_options(pbkrtest.limit = 50000, lmerTest.limit = 50000)
+
+# Estimated marginal means for each experiment × response_order cell
+emm <- emmeans(model_3, ~ experiment * response_order)
+
+# LLM vs. Human at each generation position
+contrast(emm, method = "revpairwise", by = "response_order")
+
+# Change across generation positions within each condition (vs. position 1)
+contrast(emm, method = "trt.vs.ctrl", ref = 1, by = "experiment")
+```
+
+### Descriptive Statistics: Value of Generated Options
+
+```{r desc-options, echo=FALSE, message=FALSE, warning=FALSE}
+# Overall mean and SD by experimental condition
+desc_options_condition <- exp2_wide.df %>%
+  group_by(Condition = experiment) %>%
+  summarise(Mean = round(mean(avg, na.rm = TRUE), 2),
+            SD   = round(sd(avg,   na.rm = TRUE), 2),
+            .groups = "drop")
+
+knitr::kable(desc_options_condition,
+             caption = "Mean composite value of generated options by condition")
+
+# Mean and SD by condition × generation position
+desc_options_order <- exp2_wide.df %>%
+  group_by(Condition = experiment, `Generation position` = response_order) %>%
+  summarise(Mean = round(mean(avg, na.rm = TRUE), 2),
+            SD   = round(sd(avg,   na.rm = TRUE), 2),
+            .groups = "drop")
+
+knitr::kable(desc_options_order,
+             caption = "Mean composite value of generated options by condition and generation position")
+```
+
+
+## Value of Actual Action
+
+We tested whether participants' evaluations of the agent's chosen action
+differed between conditions.
+
+```{r actual-action, message=FALSE, warning=FALSE}
+model_act <- lmer(avg ~ experiment + (1 | scenario) + (1 | participant),
+                  data = exp2_wide_act.df, REML = FALSE)
+
+anova(model_act)
+coef(summary(model_act))
+```
+
+### Descriptive Statistics: Value of Actual Action
+
+```{r desc-action, echo=FALSE, message=FALSE, warning=FALSE}
+desc_action <- exp2_wide_act.df %>%
+  group_by(Condition = experiment) %>%
+  summarise(Mean = round(mean(avg, na.rm = TRUE), 2),
+            SD   = round(sd(avg,   na.rm = TRUE), 2),
+            .groups = "drop")
+
+knitr::kable(desc_action,
+             caption = "Mean composite value of actual action by condition")
+```
+
+
+## Effect of Experimental Condition and Sample Sum on Blame Ratings
+
+We examined whether blame ratings were predicted by experimental condition
+(LLM vs. Human), the sample sum, or both. All models included scenario and
+participant as crossed random intercepts. Rows with missing sample sums (due
+to a missing actual action rating for one scenario) were excluded, leaving a
+consistent dataset across all model comparisons.
+
+```{r blame-models, message=FALSE, warning=FALSE}
+# Null model
+model_null <- lmer(blame ~ 1 + (1 | scenario) + (1 | participant),
+                   data = exp2_blame.df, REML = FALSE)
+
+# Experiment only
+model_exp <- lmer(blame ~ experiment + (1 | scenario) + (1 | participant),
+                  data = exp2_blame.df, REML = FALSE)
+
+# Sample sum only
+model_sample <- lmer(blame ~ sampleSum + (1 | scenario) + (1 | participant),
+                     data = exp2_blame.df, REML = FALSE)
+
+# Experiment + sample sum (full model)
+full_model <- lmer(blame ~ experiment + sampleSum + (1 | scenario) + (1 | participant),
+                   data = exp2_blame.df, REML = FALSE)
+
+# Model comparison: does experiment condition predict blame?
+cat("--- Null vs. experiment ---\n")
+anova(model_null, model_exp)
+coef(summary(model_exp))
+
+# Model comparison: does sample sum add explanatory power over experiment alone?
+cat("\n--- Experiment vs. experiment + sample sum ---\n")
+anova(model_exp, full_model)
+coef(summary(full_model))
+```
+
+### Descriptive Statistics: Blame Ratings
+
+```{r desc-blame, echo=FALSE, message=FALSE, warning=FALSE}
+desc_blame <- exp2_blame.df %>%
+  group_by(Condition = experiment) %>%
+  summarise(Mean = round(mean(blame, na.rm = TRUE), 2),
+            SD   = round(sd(blame,   na.rm = TRUE), 2),
+            .groups = "drop")
+
+knitr::kable(desc_blame,
+             caption = "Mean blame rating by condition")
+```
+
+
+# Figures
+
+## Blame Ratings by Condition
+
+```{r figure-blame, echo=FALSE, message=FALSE, warning=FALSE}
+dir.create("../figures", showWarnings = FALSE)
+
+FigB <- exp2.df %>%
+  mutate(blame = as.numeric(blame)) %>%
+  ggplot(aes(x = factor(experiment), fill = factor(experiment), y = blame)) +
+  stat_summary(fun = mean, geom = "bar", position = "dodge",
+               colour = "black", alpha = 0.5) +
+  stat_summary(fun.data = mean_se, geom = "errorbar",
+               position = position_dodge(width = 0.90), width = 0.2) +
+  geom_jitter(position = position_jitter(width = 0.15, height = 0.2),
+              alpha = 0.08, colour = "black") +
+  scale_fill_manual(values = c("#7DC0A6", "#B0D667"),
+                    labels = c("Human", "LLM")) +
+  labs(x = NULL, y = "Blame Rating", title = "Blame Judgment") +
+  theme_bw() +
+  theme(
+    plot.title       = element_text(size = 16, hjust = 0.5),
+    plot.background  = element_blank(),
+    legend.position  = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(color = "black", size = 14),
+    axis.text.y      = element_text(size = rel(1.4)),
+    axis.title       = element_text(size = rel(1.5), vjust = 0.9),
+    axis.text.x      = element_text(size = 16),
+    axis.ticks       = element_blank(),
+    legend.text      = element_text(size = rel(1.5)),
+    legend.title     = element_text(size = rel(1.5))
+  ) +
+  guides(fill = "none")
+
+plot(FigB)
+ggsave(FigB, file = "../figures/figB.jpg", width = 4, height = 6, dpi = 300)
+```
+
+## Value of Generated Options by Generation Number
+
+```{r figure-options, echo=FALSE, fig.height=5.25, fig.width=7, message=FALSE, warning=FALSE}
+fig2 <- exp2_long.df %>%
+  filter(response_category != "counterfactual",
+         response_order != "act") %>%
+  mutate(
+    response_category = factor(response_category,
+                                levels = c("probability", "morality", "normality")),
+    response       = as.numeric(response),
+    response_order = factor(response_order,
+                            levels = c("1", "2", "3", "4", "5"))
+  ) %>%
+  ggplot(aes(x = response_order, y = response, fill = experiment)) +
+  geom_boxplot(position = "dodge", alpha = 0.6, outlier.alpha = 0) +
+  geom_smooth(
+    data = . %>% filter(response_order %in% c("1", "2", "3", "4", "5")),
+    aes(y = response, x = as.numeric(as.character(response_order)),
+        color = experiment),
+    method = "lm",
+    position = position_dodge(width = 0.75),
+    inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("#7DC0A6", "#B0D667"),
+                    labels = c("Human", "LLM")) +
+  scale_color_manual(values = c("#7DC0A6", "#B0D667"),
+                     labels = c("Human", "LLM")) +
+  labs(x = "Generation number", y = "Value of option generated",
+       fill = "Condition:", color = "Condition:") +
+  theme_bw() +
+  theme(
+    plot.background  = element_blank(),
+    legend.position  = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(color = "black", size = 14),
+    axis.text.y      = element_text(size = rel(1.4)),
+    axis.title       = element_text(size = rel(1.5), vjust = 0.9),
+    axis.text.x      = element_text(size = rel(1.5)),
+    axis.ticks       = element_blank(),
+    legend.text      = element_text(size = rel(1.5)),
+    legend.title     = element_text(size = rel(1.5))
+  ) +
+  facet_wrap(~ response_category)
+
+fig2
+ggsave(fig2, file = "figures/fig2.jpg", width = 11, height = 6, dpi = 300)
+```
+
+## Value of Chosen Action by Condition
+
+```{r figure-action, echo=FALSE, message=FALSE, warning=FALSE}
+FigA <- exp2_wide_act.df %>%
+  ggplot(aes(x = experiment, fill = experiment, y = avg)) +
+  geom_boxplot(width = 0.55, alpha = 0.5, colour = "black",
+               outlier.shape = NA) +
+  geom_jitter(position = position_jitter(width = 0.15, height = 0.2),
+              alpha = 0.08, colour = "black") +
+  stat_summary(fun = mean, geom = "point", size = 3, colour = "black") +
+  stat_summary(fun.data = mean_se, geom = "errorbar",
+               width = 0.15, colour = "black") +
+  scale_fill_manual(values = c("#7DC0A6", "#B0D667"),
+                    labels = c("Human", "LLM")) +
+  labs(title = "Value of Chosen Action",
+       x = NULL, y = "Average Value of Chosen Action") +
+  theme_bw() +
+  theme(
+    plot.title       = element_text(size = 16, hjust = 0.5),
+    plot.background  = element_blank(),
+    legend.position  = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(color = "black", size = 14),
+    axis.text.y      = element_text(size = rel(1.4)),
+    axis.title       = element_text(size = rel(1.5), vjust = 0.9),
+    axis.text.x      = element_text(size = 16),
+    axis.ticks       = element_blank(),
+    legend.text      = element_text(size = rel(1.5)),
+    legend.title     = element_text(size = rel(1.5))
+  ) +
+  guides(fill = "none")
+
+plot(FigA)
+ggsave(FigA, file = "figures/figA.jpg", width = 4, height = 6, dpi = 300)
+```
