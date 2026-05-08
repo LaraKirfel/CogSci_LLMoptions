@@ -1,0 +1,360 @@
+---
+title: "plot_clusterlabels"
+author: ""
+date: "2026-01-13"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tibble)
+library(readr)
+library(lmerTest)
+library(tidytext)
+library(knitr)
+library(ggrepel)
+library(irr)  # Install this package once outside of the document
+library(purrr)
+library(janitor)
+library(stringr)
+library(data.table)
+library(arrow)
+library(emmeans)
+library(forcats)
+library(viridis)
+library(patchwork)
+
+rm(list = ls()) 
+knitr::opts_chunk$set(echo = TRUE, dpi = 300, fig.width = 7)  # Set echo = TRUE for troubleshooting
+
+if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+  this_file <- rstudioapi::getActiveDocumentContext()$path
+  setwd(dirname(this_file))
+}
+
+myTheme <- theme(
+  axis.title.x = element_blank(), 
+  axis.title.y = element_text(color = "black", size = 16, vjust = 0.9), 
+  axis.text.x = element_text(color = "black", size = 16),
+  axis.text.y = element_text(color = "black", size = 16), 
+  strip.text.x = element_text(color = "black", size = 16), # Facet title font
+  legend.text = element_text(color = "black", size = 16),
+  legend.title = element_text(color = "black", size = 16),
+  legend.position = "top",
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_rect(fill = "white") # White background for facet titles
+)
+
+```
+
+## Data wrangling 
+extract ratings and embedding-IDs from the study (only needs to be excuted once: copy with edit from Study2.rmd)
+
+```{r}
+hum <- fread("../data/main/human.csv")
+
+llm1 <- fread("../data/main/llm.csv")
+llm1[, `icecream2` := NULL]
+
+llm2 <- fread("../data/main/llm2.csv")
+
+# Base R
+llm <- rbind(llm1, llm2)
+
+llm.df <- llm %>%
+   clean_names() %>%       # fixes duplicates & makes snake_case
+   select(-matches("_Response")) %>%
+  mutate(experiment = "LLM") %>%
+  slice(-c(1:2))
+
+hum.df <- hum %>%
+  clean_names() %>%
+   select(-matches("_fr_")) %>%
+   mutate(experiment = "Human") %>%
+   slice(-c(1:2))
+
+
+
+main.df <- bind_rows(llm.df, hum.df) %>%
+     filter(progress == 100,
+             distribution_channel != "preview") %>%
+   #turn empty string into NA
+   mutate(across(everything(), ~ na_if(., "")))
+
+main.df <- subset(
+  main.df,
+  is.na(compromised) |
+    !(
+      (compromised == "Yes") |
+      (!is.na(q_recaptcha_score) & q_recaptcha_score <= 0.5) |
+      (!is.na(icecream) & icecream == "Salt and Pepper")
+    )
+)
+
+
+# # Create Basic Wide Dataframe with all ratings
+exp1.df<-main.df %>%
+  mutate(participant = 1:n()) %>%
+  select(x1_s1_t_first_click:x117_s9_cf5_6,
+         x120_s5_t_first_click:x223_s5_cf5_6,
+         scenario_id_1, scenario_id_2, scenario_id_3,
+         option_id_1, option_id_2, option_id_3,
+         participant,
+         experiment, response_id,
+         condition)%>%
+  select(-contains("last_click"), -contains("click_count")) %>%
+  gather(category, response, -participant,-experiment, -response_id,
+         -condition, -option_id_1, -option_id_2, -option_id_3,
+         -scenario_id_1, -scenario_id_2, -scenario_id_3) %>%
+  filter(response != "") %>%
+  mutate(exp_condition = case_when(
+    str_detect(condition, "1") ~ "judgment last",
+    str_detect(condition, "2") ~ "judgment first")) %>%
+  mutate(scenario = case_when(
+    str_detect(category, "s1_") ~ "scenario 1",
+    str_detect(category, "s2_") ~ "scenario 2",
+    str_detect(category, "s3_") ~ "scenario 3",
+    str_detect(category, "s4_") ~ "scenario 4",
+    str_detect(category, "s5_") ~ "scenario 5",
+    str_detect(category, "s6_") ~ "scenario 6",
+    str_detect(category, "s7_") ~ "scenario 7",
+    str_detect(category, "s8_") ~ "scenario 8",
+    str_detect(category, "s9_") ~ "scenario 9")) %>%
+  mutate(responsetype = case_when(
+    str_detect(category, "a1_4") ~ "prob_resp_1",
+    str_detect(category, "a1_5") ~ "moral_resp_1",
+    str_detect(category, "a1_6")  ~ "normal_resp_1",
+    str_detect(category, "a2_4") ~ "prob_resp_2",
+    str_detect(category, "a2_5") ~ "moral_resp_2",
+    str_detect(category, "a2_6")  ~ "normal_resp_2",
+    str_detect(category, "a3_4") ~ "prob_resp_3",
+    str_detect(category, "a3_5") ~ "moral_resp_3",
+    str_detect(category, "a3_6")  ~ "normal_resp_3",
+    str_detect(category, "a4_4") ~ "prob_resp_4",
+    str_detect(category, "a4_5") ~ "moral_resp_4",
+    str_detect(category, "a4_6")  ~ "normal_resp_4",
+    str_detect(category, "a5_4") ~ "prob_resp_5",
+    str_detect(category, "a5_5") ~ "moral_resp_5",
+    str_detect(category, "a5_6")  ~ "normal_resp_5",
+    str_detect(category, "ar_4") ~ "prob_resp_act",
+    str_detect(category, "ar_5") ~ "moral_resp_act",
+    str_detect(category, "ar_6")  ~ "normal_resp_act",
+    str_detect(category, "b_")  ~ "blame",
+    str_detect(category, "cf1") ~ "cf_1",
+    str_detect(category, "cf2") ~ "cf_2",
+    str_detect(category, "cf3") ~ "cf_3",
+    str_detect(category, "cf4") ~ "cf_4",
+    str_detect(category, "cf5") ~ "cf_5",
+    str_detect(category, "first_click") ~ "first_click",
+    str_detect(category, "page_submit") ~ "page_submit"
+  )) %>%
+  select(-condition, -category) %>%
+  pivot_wider(names_from = responsetype,
+              values_from = response,
+              values_fn = first)
+
+write_rds(exp1.df, "../data/exp1_df.rds")
+```
+
+
+## Merge ratings and clusterlabels
+```{r, echo=FALSE}
+df <- read_csv("./output/original/distances_and_clusters.csv") %>% mutate(response_number = as.integer(response_number)) %>% mutate(response_id = as.character(response_id))
+
+ratings <- readRDS("../data/exp1_df.rds") %>% 
+  select(scenario_id_1 , scenario_id_2, scenario_id_3, 
+         option_id_1, option_id_2, option_id_3,
+         scenario ,blame,
+         prob_resp_1, moral_resp_1, normal_resp_1, cf_1,
+         prob_resp_2, moral_resp_2, normal_resp_2, cf_2,
+         prob_resp_3, moral_resp_3, normal_resp_3, cf_3,
+         prob_resp_4, moral_resp_4, normal_resp_4, cf_4, 
+         prob_resp_5, moral_resp_5, normal_resp_5, cf_5
+         ) %>% 
+  mutate(scenario_id_1 = as.integer(scenario_id_1),
+         scenario_id_2 = as.integer(scenario_id_2),
+         scenario_id_3 = as.integer(scenario_id_3),
+         scenario = as.integer(str_extract(scenario, "\\d+"))) %>%
+  mutate(
+    option_id = case_when(
+      scenario == scenario_id_1 ~ option_id_1,
+      scenario == scenario_id_2 ~ option_id_2,
+      scenario == scenario_id_3 ~ option_id_3,
+      TRUE ~ NA_character_
+    )
+  ) %>% 
+  select(-scenario_id_1 , -scenario_id_2, -scenario_id_3, 
+         -option_id_1, -option_id_2, -option_id_3)
+
+ratings_long <- ratings %>%
+  rename_with(
+    ~ sub("^cf_", "cf_resp_", .x),
+    starts_with("cf_")
+  ) %>%
+  pivot_longer(
+    cols = matches("^(prob|moral|normal|cf)_resp_[1-5]$"),
+    names_to = c("measure", "response_number"),
+    names_pattern = "(prob|moral|normal|cf)_resp_([1-5])",
+    values_to = "value"
+  ) %>%
+  mutate(response_number = as.integer(response_number)) %>% 
+  rename(response_id = option_id) %>% 
+  pivot_wider(
+    names_from  = measure,
+    values_from = value,
+    values_fn   = first
+  ) %>%
+  arrange(response_id, scenario, response_number) %>%
+  select(response_id, scenario, response_number, blame,
+         prob, moral, normal, cf)
+
+
+df <- df %>% left_join(ratings_long,
+    by = c("response_id", "scenario", "response_number")
+  )
+
+
+df<- df %>%
+  mutate(
+    # cut the label string after the first . 
+    cluster_kmeans_label = str_split_fixed(cluster_kmeans_label, "\\.", 2)[,1],
+    blame = as.numeric(blame),
+    prob = as.numeric(prob),
+    moral = as.numeric(moral),
+    normal = as.numeric(normal),
+    value = rowMeans(across(c(prob, moral, normal)), na.rm = TRUE),
+    cf = as.numeric(cf),
+    type = forcats::fct_recode(
+      type,
+      Action = "action",
+      Human  = "human",
+      LLM    = "llm"
+    )) %>% 
+  filter(type != "Action")
+
+```
+
+
+```{r, fig.width=14, fig.height=6}
+SCENARIO <- 3
+var <- "value"
+
+plot_df <- df %>%
+  filter(
+    scenario == SCENARIO,
+    !is.na(cluster_kmeans),
+    !is.na(type),
+    type != "Action"
+  ) %>%
+  group_by(cluster_kmeans_label, type) %>%
+  summarise(
+    n     = n(),
+    value = mean(.data[[var]], na.rm = TRUE),
+    cluster_kmeans = {
+      x <- cluster_kmeans[!is.na(cluster_kmeans)]
+      if (length(x) == 0) NA_real_ else x[1]
+    },
+    .groups = "drop"
+  ) %>%
+  group_by(type) %>%
+  arrange(desc(n), .by_group = TRUE) %>%
+  ungroup()
+
+plot_df %>% filter(type == "Human") %>% select(cluster_kmeans,cluster_kmeans_label) %>% arrange(cluster_kmeans) 
+
+
+label_map_hum <- c(
+  "0"  = "Give ticket to Ted; skip concert",
+  "1"  = "Skip the concert",
+  "2"  = "Check for a digital ticket",
+  "3"  = "Go home to retrieve the ticket",
+  "4"  = "Buy a new ticket",
+  "5"  = "Give Ted your ticket",
+  "6"  = "Go home",
+  "7"  = "Wait for Ted",
+  "8"  = "Look for ticket resale options",
+  "9"  = "Contact the venue",
+  "10" = "Try to sneak in",
+  "11" = "Go back together with Ted"
+)
+
+plot_df %>% filter(type == "LLM") %>% select(cluster_kmeans,cluster_kmeans_label) %>% arrange(cluster_kmeans) 
+
+label_map_llm <- c(
+  "0"  = "Wait together; negotiate entry",
+  "1" = "Request ticket reissue",
+  "2"  = "Call someone to deliver ticket",
+  "3"  = "Show online ticket copy at entry",
+  "4"  = "Ask around for spare ticket",
+  "5"  = "Check if tickets still available",
+  "6"  = "Ask staff: ID plus purchase proof",
+  "7"  = "Use rideshare to fetch ticket",
+  "8"  = "Buy another ticket at venue",
+  "9"  = "Call box office for reprint",
+  "10" = "Check phone/email for digital ticket",
+  "11" = "Wait nearby; bring ticket at break"
+)
+
+plot_df <- plot_df %>%
+  mutate(
+    labels_short = dplyr::case_when(
+      type == "LLM" ~ dplyr::recode(
+        as.character(cluster_kmeans),
+        !!!label_map_llm,
+        .default = as.character(cluster_kmeans_label)
+      ),
+      TRUE ~ dplyr::recode(
+        as.character(cluster_kmeans),
+        !!!label_map_hum,
+        .default = as.character(cluster_kmeans_label)
+      )
+    )
+  ) %>%
+  mutate(
+    labels_short = reorder_within(labels_short, -n, type)
+  )
+
+
+p <- ggplot(
+  plot_df,
+  aes(x = labels_short, y = n, fill = value)
+) +
+  geom_col(width = 0.9, colour = "black") +   # remove alpha here
+  facet_wrap(~ type, scales = "free_x", drop = TRUE) +
+  scale_x_reordered() +
+  scale_fill_viridis_c(option = "D", alpha = 0.7) +   # alpha in the scale
+  labs(
+    x = "Cluster",
+    y = "Number of responses",
+    fill = "Value"
+  ) +
+  theme_bw(base_size = 16) +
+  myTheme +
+  theme(
+    axis.text.x = element_text(angle = 40, hjust = 1, vjust = 1, size = 16),
+    legend.position = "left",
+    strip.background = element_rect(fill = "grey85", colour = "grey40"),
+    strip.text = element_text(face = "plain", size = 16)
+  )
+
+p
+
+out_dir <- file.path("plots", "type_clustering", var)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    
+ggsave(
+  sprintf(
+    "plots/type_clustering/%s/cluster_scenario%d.png",
+    var, SCENARIO
+    ),
+  plot = p,
+  width =14, height = 6, dpi = 300, limitsize = FALSE
+  )
+```
+
+
