@@ -1,0 +1,386 @@
+---
+title: "Analyze Distances"
+author: ""
+date: "2026-01-13"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE} 
+library(tidyverse)
+library(tibble)
+library(readr)
+library(lmerTest)
+library(nlme)
+library(knitr)
+library(ggrepel)
+library(irr)  # Install this package once outside of the document
+library(purrr)
+library(janitor)
+library(stringr)
+library(data.table)
+library(arrow)
+library(emmeans)
+library(forcats)
+library(viridis)
+library(patchwork)
+library(emmeans)
+library(car)
+library(quanteda)
+library(quanteda.textstats)
+library(udpipe)
+
+rm(list = ls()) 
+knitr::opts_chunk$set(echo = TRUE, dpi = 300, fig.width = 7)  # Set echo = TRUE for troubleshooting
+
+# options(digits = 2) # round after 2 significant digits
+
+if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+  this_file <- rstudioapi::getActiveDocumentContext()$path
+  setwd(dirname(this_file))
+}
+```
+
+## Load data from analysis.iypnb
+```{r}
+df <- read_csv("output/original/distances_and_clusters.csv")
+```
+
+
+## Wrangle Data
+```{r}
+df <- df %>%
+  rename(experimental_condition = type,
+         generation_number = response_number,
+         centroid_dist = p_dist_cosine,
+         m_pairwise_dist = m_dist_cosine) %>% 
+  mutate(participant = as.character(response_id)) %>%
+  mutate(
+    scenario = factor(scenario),
+    generation_number = as.numeric(generation_number),
+    llm = ifelse(str_detect(experimental_condition, "llm"), 1, 0)
+  )
+
+df <- df %>% filter(experimental_condition != "action")
+```
+
+
+# Descriptives
+
+```{r}
+df$word_count <- ntoken(df$response, remove_punct = TRUE)
+
+
+df %>% group_by(experimental_condition) %>% 
+  summarise(
+    mean_c_dist = mean(centroid_dist, na.rm = T),
+    mean_pairwise_dist = mean(m_pairwise_dist, na.rm = T),
+    mean_word_count = mean(word_count, na.rm = T),
+    min_word_count = min(word_count, na.rm = T),
+    max_word_count = max(word_count, na.rm = T)
+  )
+
+vars <- df %>% 
+  select(centroid_dist, m_pairwise_dist, llm, generation_number , word_count)
+
+cor(vars, use = "pairwise.complete.obs")
+```
+
+
+# 1. MEAN PAIRWISE COSINE DISTANCE
+Mean paiwise cosine distance between options a participant or LLM generated within a scenario.
+
+## 1.1. Group-Level Descriptives
+```{r}
+
+m_dist <- ggplot(df, aes(x = experimental_condition, y = m_pairwise_dist)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7) +  theme_classic() +
+  labs(
+    x = "experimental_condition",
+    y = "Mean Pairwise Cosine distance within a Participant"
+  )
+
+m_dist
+
+df %>%
+  group_by(experimental_condition) %>%
+  summarise(
+    mean = mean(m_pairwise_dist, na.rm = TRUE),
+    sd = sd(m_pairwise_dist, na.rm = TRUE),
+    var = var(m_pairwise_dist, na.rm = TRUE),
+    n = sum(!is.na(m_pairwise_dist)),
+    .groups = "drop"
+  )
+```
+
+
+## 1.2. Mixed-Effects Model
+```{r}
+m_dist_het <- lme(
+  fixed = m_pairwise_dist ~ experimental_condition * generation_number,
+  random = list(scenario = ~ 1, participant = ~1),
+  weights = varIdent(form = ~ 1 | experimental_condition),         # unequal residual variance by experimental_condition
+  data = df,
+  method = "REML"
+)
+
+summary(m_dist_het)
+
+# Simple slopes for interaction
+print(test(emtrends(m_dist_het, ~ experimental_condition, var = "generation_number")))
+```
+
+## 1.3. LR Test for variance
+
+```{r}
+
+m_dist_hom <- lme(
+  fixed = m_pairwise_dist ~ experimental_condition * generation_number,
+  random = list(scenario = ~ 1, participant = ~1),
+  data = df,
+  method = "REML"
+)
+
+print(anova(m_dist_hom, m_dist_het))
+
+```
+## 1.4. LR Test for interaction
+
+```{r}
+
+m_add <- lme(
+  m_pairwise_dist ~ experimental_condition + generation_number,
+  random = list(scenario = ~1, participant = ~1),
+  weights = varIdent(form = ~1 | experimental_condition),
+  data = df,
+  method = "ML"
+)
+
+m_int <- lme(
+  m_pairwise_dist ~ experimental_condition * generation_number,
+  random = list(scenario = ~1, participant = ~1),
+  weights = varIdent(form = ~1 | experimental_condition),
+  data = df,
+  method = "ML"
+)
+
+print(anova(m_add, m_int)) # LR test for the interaction
+```
+
+
+## 1.5. Model Diagnostics
+```{r, fig.width=15, fig.height=5, out.width="100%"}
+diag_m_dist <- data.frame(
+  fitted = fitted(m_dist_het),
+  resid  = resid(m_dist_het, type = "normalized")
+)
+
+p_resid_m_dist <- ggplot(diag_m_dist, aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() +
+  labs(title = "Residuals vs Fitted")
+
+p_qq_res_m_dist <- ggplot(
+  data.frame(resid = resid(m_dist_het, type = "normalized")),
+  aes(sample = resid)
+) +
+  stat_qq(alpha = 0.6) +
+  stat_qq_line(linetype = "dashed") +
+  theme_classic() +
+  labs(title = "Normal Q-Q (Normalized residuals)")
+
+re_df <- ranef(m_dist_het)
+re_response <- re_df$participant[, "(Intercept)"]
+
+p_qq_re_response <- ggplot(
+  data.frame(re = re_response),
+  aes(sample = re)
+) +
+  stat_qq(alpha = 0.3) +
+  stat_qq_line(linetype = "dashed") +
+  theme_classic() +
+  labs(title = "Normal Q-Q (Random effects: participant)")
+
+p_resid_m_dist + p_qq_res_m_dist + p_qq_re_response +
+  plot_layout(ncol = 3)
+```
+
+# 2. CENTROID DISTANCE
+Cosine distance to the Centroid of the 5 options a participant or LLM generated within a scenario.
+
+## 2.1. Group-Level Descriptives
+```{r}
+
+p_centroid <- ggplot(df, aes(x = experimental_condition, y = centroid_dist)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7) +
+  theme_classic() +
+  labs(
+    x = "experimental_condition",
+    y = "Cosine distance to Participant Centroid"
+  )
+
+p_centroid
+
+df %>%
+  group_by(experimental_condition) %>%
+  summarise(
+    mean = mean(centroid_dist, na.rm = TRUE),
+    sd = sd(centroid_dist, na.rm = TRUE),
+    var = var(centroid_dist, na.rm = TRUE),
+    n = sum(!is.na(centroid_dist)),
+    .groups = "drop"
+  )
+```
+
+
+## 2.2. Mixed-Effects Model
+```{r}
+p_centroid_het <- lme(
+  fixed = centroid_dist ~ experimental_condition * generation_number,
+  random = list(scenario = ~ 1, participant = ~1),
+  weights = varIdent(form = ~ 1 | experimental_condition),         # unequal residual variance by experimental_condition
+  data = df,
+  method = "REML"
+)
+
+summary(p_centroid_het)
+
+# Simple slopes for interaction
+print(test(emtrends(p_centroid_het, ~ experimental_condition, var = "generation_number")))
+```
+
+## 2.3. LR Test for variance
+
+```{r}
+p_centroid_het <- lme(
+  fixed = centroid_dist ~ experimental_condition * generation_number,
+  random = list(scenario = ~ 1, participant = ~1),
+  weights = varIdent(form = ~ 1 | experimental_condition),         # unequal residual variance by experimental_condition
+  data = df,
+  method = "REML"
+)
+
+p_centroid_hom <- lme(
+  fixed = centroid_dist ~ experimental_condition * generation_number,
+  random = list(scenario = ~ 1, participant = ~1),
+  data = df,
+  method = "REML"
+)
+
+print(anova(p_centroid_hom, p_centroid_het))
+```
+## 2.4. LR Test for interaction
+
+```{r}
+p_add <- lme(
+  centroid_dist ~ experimental_condition + generation_number,
+  random = list(scenario = ~1, participant = ~1),
+  weights = varIdent(form = ~1 | experimental_condition),
+  data = df,
+  method = "ML"
+)
+
+p_int <- lme(
+  centroid_dist ~ experimental_condition * generation_number,
+  random = list(scenario = ~1, participant = ~1),
+  weights = varIdent(form = ~1 | experimental_condition),
+  data = df,
+  method = "ML"
+)
+
+print(anova(p_add, p_int))   # LR test for the interaction
+```
+
+
+## 2.5. Model Diagnostics
+```{r, fig.width=15, fig.height=5, out.width="100%"}
+diag_centroid <- data.frame(
+  fitted = fitted(p_centroid_het),
+  resid  = resid(p_centroid_het, type = "normalized")
+)
+
+p_resid_centroid <- ggplot(diag_centroid, aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() +
+  labs(title = "Residuals vs Fitted")
+
+p_qq_res_centroid <- ggplot(
+  data.frame(resid = resid(p_centroid_het, type = "normalized")),
+  aes(sample = resid)
+) +
+  stat_qq(alpha = 0.6) +
+  stat_qq_line(linetype = "dashed") +
+  theme_classic() +
+  labs(title = "Normal Q-Q (Normalized residuals)")
+
+re_df <- ranef(p_centroid_het)
+re_response <- re_df$participant[, "(Intercept)"]
+
+p_qq_re_response <- ggplot(
+  data.frame(re = re_response),
+  aes(sample = re)
+) +
+  stat_qq(alpha = 0.3) +
+  stat_qq_line(linetype = "dashed") +
+  theme_classic() +
+  labs(title = "Normal Q-Q (Random effects: participant)")
+
+p_resid_centroid + p_qq_res_centroid + p_qq_re_response +
+  plot_layout(ncol = 3)
+```
+
+# ROBUSTNESS CHECKS
+
+## WORD COUNT CONTROL
+Although including word count as a control preserves statistical significance for mean-pairwise-distance, the limited common support across conditions means the adjustment relies on extrapolation outside the overlap region rather than on within-range comparison. We therefore exclude word count as a covariate.
+
+```{r}
+# Check for support
+ggplot(df, aes(x = word_count, color = experimental_condition, fill = experimental_condition)) +
+  geom_density(alpha = 0.2) +
+  labs(
+    x = "Wordcount",
+    y = "Density",
+    title = "Density of Wordcount by Experimental Condition"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+c_wc <- lme(
+  fixed = centroid_dist ~ experimental_condition * generation_number + word_count,
+  random = list(scenario = ~ 1, participant = ~1),
+  weights = varIdent(form = ~ 1 | experimental_condition),         # unequal residual variance by experimental_condition
+  data = df,
+  method = "REML"
+)
+
+vif(c_wc)
+
+
+pd_wc <- lme(
+  fixed = m_pairwise_dist ~ experimental_condition * generation_number + word_count,
+  random = list(scenario = ~ 1, participant = ~1),
+  weights = varIdent(form = ~ 1 | experimental_condition),         # unequal residual variance by experimental_condition
+  data = df,
+  method = "REML"
+)
+
+vif(pd_wc)
+
+summary(c_wc)
+summary(pd_wc)
+```
+
+
+
+
+
+
