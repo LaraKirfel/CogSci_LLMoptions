@@ -15,6 +15,17 @@ Much of high-level cognition relies on identifying which possibilities are relev
     </ul>
 </ul> 
 
+## Analysis
+
+### Study 1
+- [Main Analysis](https://github.com/LaraKirfel/CogSci_LLMoptions/blob/main/Study%201/data%20and%20analysis/Study1.html)
+- [Distance Analysis](https://github.com/LaraKirfel/CogSci_LLMoptions/blob/main/Study%201/embeddings/analyze_distance.html)
+- [Clustering](https://github.com/LaraKirfel/CogSci_LLMoptions/blob/main/Study%201/embeddings/clustering.ipynb)
+
+### Study 2
+- [Main Analysis](https://github.com/LaraKirfel/CogSci_LLMoptions/blob/main/Study%202/data%20and%20analysis/Study2.html)
+
+
 ## Repository structure 
 
 ```
